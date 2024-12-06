@@ -224,37 +224,37 @@ final case class Endpoint[PathInput, Input, Err, Output, Auth <: AuthType](
   ): Endpoint[PathInput, combiner.Out, Err, Output, Auth] =
     copy(input = self.input ++ codec)
 
-  def implement[Env](f: Input => ZIO[Env, Err, Output])(implicit
+  def implement[Env](f: Input => ZIO[Env, Err, Output], decodeErrorMapper: Option[(Throwable, Request)=> Err] = None)(implicit
     trace: Trace,
   ): Route[Env, Nothing] =
-    implementHandler(Handler.fromFunctionZIO(f))
+    implementHandler(Handler.fromFunctionZIO(f), decodeErrorMapper)
 
-  def implementEither(f: Input => Either[Err, Output])(implicit
+  def implementEither(f: Input => Either[Err, Output], decodeErrorMapper: Option[(Throwable, Request)=> Err] = None)(implicit
     trace: Trace,
   ): Route[Any, Nothing] =
-    implementHandler[Any](Handler.fromFunctionHandler[Input](in => Handler.fromEither(f(in))))
+    implementHandler[Any](Handler.fromFunctionHandler[Input](in => Handler.fromEither(f(in))), decodeErrorMapper)
 
-  def implementPurely(f: Input => Output)(implicit
+  def implementPurely(f: Input => Output, decodeErrorMapper: Option[(Throwable, Request)=> Err] = None)(implicit
     trace: Trace,
   ): Route[Any, Nothing] =
-    implementHandler[Any](Handler.fromFunctionHandler[Input](in => Handler.succeed(f(in))))
+    implementHandler[Any](Handler.fromFunctionHandler[Input](in => Handler.succeed(f(in))), decodeErrorMapper)
 
-  def implementAs(output: Output)(implicit
+  def implementAs(output: Output, decodeErrorMapper: Option[(Throwable, Request)=> Err] = None)(implicit
     trace: Trace,
   ): Route[Any, Nothing] =
-    implementHandler[Any](Handler.succeed(output))
+    implementHandler[Any](Handler.succeed(output), decodeErrorMapper)
 
-  def implementAsZIO(output: ZIO[Any, Err, Output])(implicit
+  def implementAsZIO(output: ZIO[Any, Err, Output], decodeErrorMapper: Option[(Throwable, Request)=> Err] = None)(implicit
     trace: Trace,
   ): Route[Any, Nothing] =
-    implementHandler[Any](Handler.fromZIO(output))
+    implementHandler[Any](Handler.fromZIO(output), decodeErrorMapper)
 
   def implementAsError(err: Err)(implicit
     trace: Trace,
   ): Route[Any, Nothing] =
-    implementHandler[Any](Handler.fail(err))
+    implementHandler[Any](Handler.fail(err), None)
 
-  def implementHandler[Env](original: Handler[Env, Err, Input, Output])(implicit trace: Trace): Route[Env, Nothing] = {
+  def implementHandler[Env](original: Handler[Env, Err, Input, Output], decodeErrorMapper: Option[(Throwable, Request)=> Err])(implicit trace: Trace): Route[Env, Nothing] = {
     import HttpCodecError.asHttpCodecError
 
     def authCodec(authType: AuthType): HttpCodec[HttpCodecType.RequestType, Unit] = authType match {
@@ -302,12 +302,23 @@ final case class Endpoint[PathInput, Input, Err, Output, Auth <: AuthType](
                   .flatMap(_.mimeTypes),
               )
               .getOrElse(defaultMediaTypes)
-          (endpoint.input ++ authCodec(endpoint.authType)).decodeRequest(request, config).orDie.flatMap { value =>
-            original(value).map(endpoint.output.encodeResponse(_, outputMediaTypes, config)).catchAll { error =>
+
+
+          val a: ZIO[Env, Throwable, Response] = (endpoint.input ++ authCodec(endpoint.authType)).decodeRequest(request, config).flatMap { value => {
+            original(value).map(endpoint.output.encodeResponse(_, outputMediaTypes, config)).catchAll {error =>
               ZIO.succeed(endpoint.error.encodeResponse(error, outputMediaTypes, config))
             }
           }
+          }
+
+          decodeErrorMapper match {
+            case Some(f) => a.catchAll{
+              err => ZIO.succeed(endpoint.error.encodeResponse(f(err, request), outputMediaTypes, config))
+            }
+            case None => a.orDie
+          }
         } -> condition
+
       }
 
     // TODO: What to do if there are no endpoints??
